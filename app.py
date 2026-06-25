@@ -10,11 +10,10 @@ import time
 from functools import lru_cache
 
 try:
-    import gspread
-    from google.oauth2.service_account import Credentials
+    from google.api_core.exceptions import ServiceUnavailable, ResourceExhausted
 except ImportError:
-    gspread = None
-    Credentials = None
+    ServiceUnavailable = Exception
+    ResourceExhausted = Exception
 
 app = Flask(__name__)
 CORS(app)
