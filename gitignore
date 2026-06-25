@@ -1,0 +1,8 @@
+# NEVER commit these
+*.json
+cookies.txt
+.env
+__pycache__/
+*.pyc
+.env.example
+daily_count.json
