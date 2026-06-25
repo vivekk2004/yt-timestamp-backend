@@ -3,6 +3,6 @@ flask-cors
 youtube-transcript-api
 google-genai
 google-api-core
-gspread
-google-auth
+gspread==6.1.4
+google-auth==2.29.0
 gunicorn
