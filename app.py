@@ -10,11 +10,13 @@ import time
 from functools import lru_cache
 
 try:
-    from google.api_core.exceptions import ServiceUnavailable, ResourceExhausted
+    import gspread
+    from google.oauth2.service_account import Credentials
 except ImportError:
-    ServiceUnavailable = Exception
-    ResourceExhausted = Exception
-
+    gspread = None
+    Credentials = None
+    print("[STARTUP] WARNING — gspread or google-auth not installed!", flush=True)
+    
 app = Flask(__name__)
 CORS(app)
 
