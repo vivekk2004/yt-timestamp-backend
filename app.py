@@ -7,6 +7,7 @@ import re
 import json
 import os
 import time
+import tempfile
 from functools import lru_cache
 
 try:
@@ -16,17 +17,16 @@ except ImportError:
     gspread = None
     Credentials = None
     print("[STARTUP] WARNING — gspread or google-auth not installed!", flush=True)
-    
+
 app = Flask(__name__)
 CORS(app)
 
 # ─────────────────────────────────────────
 # CONFIG — all values come from environment variables
-# Set these in Koyeb dashboard under Environment
 # ─────────────────────────────────────────
 
 GEMINI_API_KEY  = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL    = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-lite")   # ← FIXED model name
 
 if not GEMINI_API_KEY:
     print("[STARTUP] WARNING — GEMINI_API_KEY is not set!", flush=True)
@@ -36,10 +36,8 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 GOOGLE_SHEET_ID   = os.getenv("GOOGLE_SHEET_ID",   "").strip()
 GOOGLE_SHEET_NAME = os.getenv("GOOGLE_SHEET_NAME", "Sheet1").strip()
 
-# On Koyeb, paste the entire contents of your .json file into this env var
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 
-# Local file fallback (only used when running locally)
 GOOGLE_SERVICE_ACCOUNT_FILE = os.path.join(
     os.path.dirname(__file__),
     "yt-timestamp-project-770a409c15aa.json"
@@ -187,7 +185,7 @@ def classify_gemini_error(error_str: str) -> dict:
     if any(x in lower for x in ["invalidapikey", "api_key_invalid", "apikey", "permission_denied", "permissiondenied"]):
         return {
             "reason": "invalid_key",
-            "user_message": "Gemini API key is invalid or missing permissions. Check your GEMINI_API_KEY in Koyeb environment variables.",
+            "user_message": "Gemini API key is invalid or missing permissions. Check your GEMINI_API_KEY in environment variables.",
         }
     if any(x in lower for x in ["serviceunavailable", "unavailable", "overloaded", "503"]):
         return {
@@ -266,25 +264,50 @@ def format_time(seconds: float) -> str:
     h, m, s = s // 3600, (s % 3600) // 60, s % 60
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
+# ─────────────────────────────────────────
+# YOUTUBE TRANSCRIPT CLIENT (cookie-aware)
+# ─────────────────────────────────────────
+
 def _make_ytt_client():
-    if os.path.exists(COOKIES_FILE):
-        dbg("YTT_CLIENT", f"cookies.txt found at: {COOKIES_FILE} — will use for requests")
+    # 1. Try env-var cookies first (Render / cloud deployment)
+    cookies_env = os.getenv("YOUTUBE_COOKIES", "").strip()
+    if cookies_env:
+        dbg("YTT_CLIENT", "Using cookies from YOUTUBE_COOKIES env var")
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+        tmp.write(cookies_env)
+        tmp.flush()
+        tmp.close()
         try:
             from youtube_transcript_api._http_client import CookieJar
-            dbg("YTT_CLIENT", "Using new CookieJar API")
+            dbg("YTT_CLIENT", "Using new CookieJar API (env var)")
+            return YouTubeTranscriptApi(http_client=CookieJar(tmp.name))
+        except (ImportError, TypeError):
+            pass
+        try:
+            dbg("YTT_CLIENT", "Using legacy cookies= API (env var)")
+            return YouTubeTranscriptApi(cookies=tmp.name)
+        except TypeError:
+            pass
+        dbg("YTT_CLIENT", "WARNING — could not pass env-var cookies to API")
+
+    # 2. Fall back to cookies.txt file on disk (local dev)
+    if os.path.exists(COOKIES_FILE):
+        dbg("YTT_CLIENT", f"Using cookies file: {COOKIES_FILE}")
+        try:
+            from youtube_transcript_api._http_client import CookieJar
+            dbg("YTT_CLIENT", "Using new CookieJar API (file)")
             return YouTubeTranscriptApi(http_client=CookieJar(COOKIES_FILE))
         except (ImportError, TypeError):
             pass
         try:
-            dbg("YTT_CLIENT", "Using legacy cookies= API")
+            dbg("YTT_CLIENT", "Using legacy cookies= API (file)")
             return YouTubeTranscriptApi(cookies=COOKIES_FILE)
         except TypeError:
             pass
-        dbg("YTT_CLIENT", "WARNING — could not pass cookies to API, trying without")
-        return YouTubeTranscriptApi()
-    else:
-        dbg("YTT_CLIENT", f"WARNING — cookies.txt NOT found at {COOKIES_FILE}.")
-        return YouTubeTranscriptApi()
+        dbg("YTT_CLIENT", "WARNING — could not pass file cookies to API")
+
+    dbg("YTT_CLIENT", "WARNING — no cookies found, YouTube IP blocks likely on cloud")
+    return YouTubeTranscriptApi()
 
 def get_transcript(video_id: str):
     dbg("TRANSCRIPT", f"Fetching transcript for video_id={video_id}")
@@ -793,24 +816,42 @@ def batch_save():
         dbg_error("ROUTE/batch-save", e)
         return jsonify({"error": f"Batch save failed: {e}"}), 500
 
+# ─────────────────────────────────────────
+# ROUTE — HEALTH CHECK
+# ─────────────────────────────────────────
+
 @app.route("/api/health", methods=["GET"])
 def health():
-    cookies_ok = os.path.exists(COOKIES_FILE)
+    cookies_env_set = bool(os.getenv("YOUTUBE_COOKIES", "").strip())
+    cookies_file_ok = os.path.exists(COOKIES_FILE)
+    if cookies_env_set:
+        cookies_status = "env var set ✓"
+    elif cookies_file_ok:
+        cookies_status = "file found ✓"
+    else:
+        cookies_status = "MISSING ✗ (IP blocks likely on cloud)"
+
     return jsonify({
         "status":      "ok",
         "model":       GEMINI_MODEL,
         "sheet_id":    GOOGLE_SHEET_ID[:10] + "…" if GOOGLE_SHEET_ID else "NOT SET",
         "gemini_key":  "SET ✓" if GEMINI_API_KEY else "MISSING ✗",
         "sa_json":     "SET ✓" if GOOGLE_SERVICE_ACCOUNT_JSON else ("file found ✓" if os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE) else "MISSING ✗"),
-        "cookies_txt": "found ✓" if cookies_ok else "missing (IP blocks possible)",
+        "cookies":     cookies_status,
     })
 
+# ─────────────────────────────────────────
+# STARTUP
+# ─────────────────────────────────────────
+
 if __name__ == "__main__":
+    cookies_env_set = bool(os.getenv("YOUTUBE_COOKIES", "").strip())
     print("=" * 60, flush=True)
-    print(f"[STARTUP] GEMINI_MODEL   = {GEMINI_MODEL}", flush=True)
-    print(f"[STARTUP] GEMINI_KEY     = {'SET ✓' if GEMINI_API_KEY else 'MISSING ✗'}", flush=True)
-    print(f"[STARTUP] SHEET_ID       = {GOOGLE_SHEET_ID[:20] + '…' if GOOGLE_SHEET_ID else 'NOT SET'}", flush=True)
-    print(f"[STARTUP] SA_JSON_ENV    = {'SET ✓' if GOOGLE_SERVICE_ACCOUNT_JSON else 'NOT SET'}", flush=True)
-    print(f"[STARTUP] COOKIES_FILE   = {COOKIES_FILE} ({'FOUND ✓' if os.path.exists(COOKIES_FILE) else 'MISSING ✗'})", flush=True)
+    print(f"[STARTUP] GEMINI_MODEL      = {GEMINI_MODEL}", flush=True)
+    print(f"[STARTUP] GEMINI_KEY        = {'SET ✓' if GEMINI_API_KEY else 'MISSING ✗'}", flush=True)
+    print(f"[STARTUP] SHEET_ID          = {GOOGLE_SHEET_ID[:20] + '…' if GOOGLE_SHEET_ID else 'NOT SET'}", flush=True)
+    print(f"[STARTUP] SA_JSON_ENV       = {'SET ✓' if GOOGLE_SERVICE_ACCOUNT_JSON else 'NOT SET'}", flush=True)
+    print(f"[STARTUP] YOUTUBE_COOKIES   = {'SET ✓ (env var)' if cookies_env_set else 'NOT SET'}", flush=True)
+    print(f"[STARTUP] COOKIES_FILE      = {COOKIES_FILE} ({'FOUND ✓' if os.path.exists(COOKIES_FILE) else 'MISSING ✗'})", flush=True)
     print("=" * 60, flush=True)
     app.run(debug=False, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
